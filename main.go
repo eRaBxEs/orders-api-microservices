@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/signal"
 
 	"github.com/erabxes/orders-api-microservices/application"
 )
@@ -10,10 +12,15 @@ import (
 func main() {
 	app := application.New()
 
-	err := app.Start(context.TODO())
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	err := app.Start(ctx)
 	if err != nil {
 		fmt.Println("failed to start app:", err)
 		return
 	}
+
+	//cancel() // if we called this func earlier it will cancel our derived context and any of the children context underneath it
 
 }
