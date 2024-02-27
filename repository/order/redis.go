@@ -25,11 +25,24 @@ func (r *RedisRepo) Insert(ctx context.Context, order model.Order) error {
 	}
 
 	key := orderIDKey(order.OrderID)
+	txn := r.Client.TxPipeline() // begin a transaction in redis
 	// to add the encoded data to the data store with our key
-	res := r.Client.SetNX(ctx, key, string(data), 0) // use SetNX rather than Set method which overwrites existing data
+	res := txn.SetNX(ctx, key, string(data), 0) // use SetNX rather than Set method which overwrites existing data
 	if err = res.Err(); err != nil {
+		txn.Discard()
 		return fmt.Errorf("failed to set: %w", err)
 	}
+
+	// to add order id to a set called orders each time
+	if err := txn.SAdd(ctx, key, "orders").Err(); err != nil {
+		txn.Discard()
+		return fmt.Errorf("failed to add to orders set : %w", err)
+	}
+
+	if _, err := txn.Exec(ctx); err != nil { // to ensure that our transaction is committed
+		return fmt.Errorf("failed to exec: %w", err)
+	}
+
 	return nil
 }
 
@@ -53,4 +66,98 @@ func (r *RedisRepo) GetById(ctx context.Context, id uint64) (model.Order, error)
 	}
 
 	return order, nil
+}
+
+func (r *RedisRepo) DeleteById(ctx context.Context, id uint64) error {
+	key := orderIDKey(id)
+
+	txn := r.Client.TxPipeline()
+	err := txn.Del(ctx, key).Err()
+	if errors.Is(err, redis.Nil) {
+		txn.Discard()
+		return ErrNotExist
+	} else if err != nil {
+		txn.Discard()
+		return fmt.Errorf("get order :%w", err)
+	}
+
+	// call the SRem function to remove our keys from the order set
+	if err := txn.SRem(ctx, key, "orders").Err(); err != nil {
+		txn.Discard()
+		return fmt.Errorf("failed to remove from orders set: %w", err)
+	}
+
+	if _, err := txn.Exec(ctx); err != nil { // to ensure that our transaction is committed
+		return fmt.Errorf("failed to exec: %w", err)
+	}
+
+	return nil
+}
+
+func (r *RedisRepo) Update(ctx context.Context, order model.Order) error {
+	data, err := json.Marshal(order)
+	if err != nil {
+		return fmt.Errorf("failed to encode order: %w", err)
+	}
+
+	key := orderIDKey(order.OrderID)
+
+	err = r.Client.SetXX(ctx, key, string(data), 0).Err()
+	if errors.Is(err, redis.Nil) {
+		return ErrNotExist
+	} else if err != nil {
+		return fmt.Errorf("set order :%w", err)
+	}
+
+	return nil
+}
+
+type FindAllPage struct {
+	Size   uint64
+	Offset uint64
+}
+
+type FindResult struct {
+	Orders []model.Order
+	Cursor uint64
+}
+
+func (r *RedisRepo) FindAll(ctx context.Context, page FindAllPage) (FindResult, error) {
+	res := r.Client.SScan(ctx, "orders", page.Offset, "*", int64(page.Size)) // where * stands for everything in the set
+
+	keys, cursor, err := res.Result()
+	if err != nil {
+		return FindResult{}, fmt.Errorf("failed to get order ids: %w", err)
+	}
+	// records will be returned in random order which is the side effect of using a set
+
+	if len(keys) == 0 { // to return an empty slice of orders if keys is empty
+		return FindResult{
+			Orders: []model.Order{},
+		}, nil
+	}
+
+	xs, err := r.Client.MGet(ctx, keys...).Result()
+	if err != nil {
+		return FindResult{}, fmt.Errorf("failed to get orders: %w", err)
+	}
+
+	// make a slice which has the same length as our resulting slice
+	orders := make([]model.Order, len(xs))
+	for i, x := range xs {
+		x := x.(string)
+		var order model.Order
+
+		err := json.Unmarshal([]byte(x), &order)
+		if err != nil {
+			return FindResult{}, fmt.Errorf("failed to decode order json: %w", err)
+		}
+
+		orders[i] = order
+	}
+
+	return FindResult{
+		Orders: orders,
+		Cursor: cursor,
+	}, nil
 }
